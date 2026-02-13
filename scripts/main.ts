@@ -7,6 +7,7 @@
 
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { mkdir } from 'node:fs/promises';
@@ -32,6 +33,7 @@ type CliArgs = {
   profile: string | null;
   json: boolean;
   help: boolean;
+  reference: string[];
 };
 
 function printUsage(): void {
@@ -45,6 +47,7 @@ Usage:
 Options:
   <text>              Image generation prompt (positional)
   -p, --prompt <text> Prompt text
+  -r, --reference <path> Reference image for Grok (repeatable for multiple)
   -o, --output <path> Output image path (default: grok-image.png)
   --all               Save all generated images (numbered)
   --timeout <secs>    Max wait time in seconds (default: 120)
@@ -62,6 +65,7 @@ function parseArgs(argv: string[]): CliArgs {
     profile: null,
     json: false,
     help: false,
+    reference: [],
   };
 
   const positional: string[] = [];
@@ -101,6 +105,13 @@ function parseArgs(argv: string[]): CliArgs {
       continue;
     }
 
+    if (a === '--reference' || a === '-r') {
+      const v = argv[++i];
+      if (!v) throw new Error(`Missing value for ${a}`);
+      out.reference.push(v);
+      continue;
+    }
+
     if (a.startsWith('-')) throw new Error(`Unknown option: ${a}`);
     positional.push(a);
   }
@@ -129,6 +140,128 @@ async function evaluate<T = unknown>(cdp: CdpConnection, sessionId: string, expr
   }
 
   return result.result.value as T;
+}
+
+/** Evaluate JS and return remote object ID (for DOM elements that can't be serialized by value) */
+async function evaluateHandle(cdp: CdpConnection, sessionId: string, expression: string): Promise<string | null> {
+  const result = await cdp.send<{
+    result: { type: string; subtype?: string; objectId?: string };
+    exceptionDetails?: { text: string };
+  }>('Runtime.evaluate', {
+    expression,
+    awaitPromise: false,
+    returnByValue: false,
+  }, { sessionId });
+
+  if (result.exceptionDetails) return null;
+  if (result.result.subtype === 'null' || result.result.type === 'undefined') return null;
+  return result.result.objectId || null;
+}
+
+/** Upload reference images to Grok's chat input by directly setting files on the hidden input */
+async function uploadReferenceImages(
+  cdp: CdpConnection,
+  sessionId: string,
+  imagePaths: string[],
+  _foundSelector: string,
+): Promise<void> {
+  const absPaths = imagePaths.map((p) => {
+    // Expand ~ to home directory (shell doesn't expand when path is quoted)
+    const expanded = p.startsWith('~/') ? path.join(os.homedir(), p.slice(2)) : p;
+    return path.resolve(expanded);
+  });
+  for (const p of absPaths) {
+    if (!fs.existsSync(p)) throw new Error(`Reference image not found: ${p}`);
+  }
+
+  console.error(`[grok] Uploading ${absPaths.length} reference image(s)...`);
+
+  // Enable file chooser interception to suppress any native OS dialogs that may be triggered
+  await cdp.send('Page.setInterceptFileChooserDialog', { enabled: true }, { sessionId });
+
+  // Catch-all handler: if a file chooser dialog is triggered by React in response
+  // to our DOM.setFileInputFiles call, cancel it immediately
+  cdp.on('Page.fileChooserOpened', async (params: unknown) => {
+    try {
+      const p = params as { backendNodeId?: number };
+      if (p.backendNodeId) {
+        // Cancel the dialog by sending an empty file list
+        await cdp.send('DOM.setFileInputFiles', {
+          files: [],
+          backendNodeId: p.backendNodeId,
+        }, { sessionId });
+      }
+    } catch {}
+  });
+
+  // Find the hidden file input element directly and set files on it.
+  // Grok's UI has hidden <input type="file"> elements - we target the image-accepting one.
+  const fileInputObjId = await evaluateHandle(cdp, sessionId, `
+    (() => {
+      // Find all file inputs
+      const inputs = document.querySelectorAll('input[type="file"]');
+      // Prefer the one that accepts images
+      for (const inp of inputs) {
+        const accept = (inp.getAttribute('accept') || '').toLowerCase();
+        if (accept.includes('image')) return inp;
+      }
+      // Fallback: return first file input
+      return inputs.length > 0 ? inputs[0] : null;
+    })()
+  `);
+
+  if (!fileInputObjId) {
+    try { await cdp.send('Page.setInterceptFileChooserDialog', { enabled: false }, { sessionId }); } catch {}
+    throw new Error(
+      'Could not find file input element in Grok UI. ' +
+      'The Grok interface may have changed or image upload may not be available.'
+    );
+  }
+
+  console.error('[grok] Found file input, setting files directly...');
+
+  // CRITICAL: Before setting files, neuter the file input's click() method.
+  // When DOM.setFileInputFiles fires a change event, React's handler calls input.click()
+  // which opens a native OS file dialog. By replacing click() with a no-op, we prevent that.
+  await evaluate(cdp, sessionId, `
+    (() => {
+      const inputs = document.querySelectorAll('input[type="file"]');
+      for (const inp of inputs) {
+        inp._origClick = inp.click;
+        inp.click = function() {};
+      }
+    })()
+  `);
+
+  // Use DOM.setFileInputFiles to set files directly on the input element.
+  await cdp.send('DOM.setFileInputFiles', {
+    files: absPaths,
+    objectId: fileInputObjId,
+  }, { sessionId });
+
+  console.error('[grok] Files set on input element');
+
+  // Wait for React to process the change event and show thumbnails
+  await sleep(3000);
+
+  // Restore the original click() method on all file inputs
+  await evaluate(cdp, sessionId, `
+    (() => {
+      const inputs = document.querySelectorAll('input[type="file"]');
+      for (const inp of inputs) {
+        if (inp._origClick) {
+          inp.click = inp._origClick;
+          delete inp._origClick;
+        }
+      }
+    })()
+  `);
+
+  // Disable file chooser interception
+  try { await cdp.send('Page.setInterceptFileChooserDialog', { enabled: false }, { sessionId }); } catch {}
+
+  console.error('[grok] Reference image(s) attached successfully');
+  await sleep(1000);
 }
 
 /** Wait for element matching selector */
@@ -449,10 +582,6 @@ async function main(): Promise<void> {
 
     console.error(`[grok] Found input: ${foundSelector}`);
 
-    // Count existing images before we send prompt (to distinguish new ones)
-    const beforeImageUrls = await extractImageUrls(cdp, sessionId);
-    const beforeCount = beforeImageUrls.length;
-
     // Focus the textarea and click it
     await evaluate(cdp, sessionId, `
       (() => {
@@ -462,9 +591,28 @@ async function main(): Promise<void> {
     `);
     await sleep(500);
 
+    // Upload reference images if provided (before typing the prompt)
+    if (args.reference.length > 0) {
+      await uploadReferenceImages(cdp, sessionId, args.reference, foundSelector);
+      // Re-focus the text input after upload (focus may have shifted)
+      await evaluate(cdp, sessionId, `
+        (() => {
+          const el = document.querySelector(${JSON.stringify(foundSelector)});
+          if (el) { el.focus(); el.click(); }
+        })()
+      `);
+      await sleep(500);
+    }
+
+    // Count existing images AFTER upload (so reference thumbnails are excluded from "new" detection)
+    const beforeImageUrls = await extractImageUrls(cdp, sessionId);
+    const beforeCount = beforeImageUrls.length;
+
     // Auto-prefix for image generation if prompt doesn't mention images
+    // Skip auto-prefix when reference images are attached (user intent is already clear)
     const lowerPrompt = args.prompt.toLowerCase();
-    const isImagePrompt = ['image', 'picture', 'draw', 'create', 'generate', 'paint', 'illustration', 'photo', 'make'].some(
+    const hasReference = args.reference.length > 0;
+    const isImagePrompt = hasReference || ['image', 'picture', 'draw', 'create', 'generate', 'paint', 'illustration', 'photo', 'make'].some(
       (kw) => lowerPrompt.includes(kw)
     );
     const finalPrompt = isImagePrompt ? args.prompt : `Generate an image of: ${args.prompt}`;
@@ -478,31 +626,49 @@ async function main(): Promise<void> {
 
     // Click the send button by dispatching a real mouse click on it
     // First, get the send button's position
-    const sendBtnInfo = await evaluate<{ x: number; y: number; found: boolean }>(cdp, sessionId, `
+    // The send button has aria-label containing "Grok" (e.g. "Grok something")
+    // The attachment button has NO aria-label - so we must skip it
+    const sendBtnInfo = await evaluate<{ x: number; y: number; found: boolean; method: string }>(cdp, sessionId, `
       (() => {
-        // The send button is the circular button with arrow icon next to the textarea
         const textarea = document.querySelector(${JSON.stringify(foundSelector)});
-        if (!textarea) return { x: 0, y: 0, found: false };
+        if (!textarea) return { x: 0, y: 0, found: false, method: 'no textarea' };
 
-        // Walk up to find the container that has both textarea and button
+        // Walk up to find the container with buttons
         let container = textarea.parentElement;
-        for (let i = 0; i < 5 && container; i++) {
+        for (let i = 0; i < 6 && container; i++) {
           const btns = container.querySelectorAll('button');
           for (const b of btns) {
-            if (b.querySelector('svg') || b.querySelector('path')) {
+            const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+            // The send button has aria-label containing "grok"
+            if (aria.includes('grok')) {
               const rect = b.getBoundingClientRect();
               if (rect.width > 0 && rect.height > 0) {
-                return {
-                  x: rect.x + rect.width / 2,
-                  y: rect.y + rect.height / 2,
-                  found: true
-                };
+                return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, found: true, method: 'aria-grok' };
               }
             }
           }
           container = container.parentElement;
         }
-        return { x: 0, y: 0, found: false };
+
+        // Fallback: find the LAST SVG button near textarea (send is typically after attachment)
+        container = textarea.parentElement;
+        for (let i = 0; i < 6 && container; i++) {
+          const btns = Array.from(container.querySelectorAll('button'));
+          let lastSvgBtn = null;
+          for (const b of btns) {
+            if (b.querySelector('svg') || b.querySelector('path')) {
+              const rect = b.getBoundingClientRect();
+              if (rect.width > 0 && rect.height > 0) lastSvgBtn = b;
+            }
+          }
+          if (lastSvgBtn) {
+            const rect = lastSvgBtn.getBoundingClientRect();
+            return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, found: true, method: 'last-svg' };
+          }
+          container = container.parentElement;
+        }
+
+        return { x: 0, y: 0, found: false, method: 'not found' };
       })()
     `);
 
