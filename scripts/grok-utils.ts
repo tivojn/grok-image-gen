@@ -1,6 +1,7 @@
 /**
- * Chrome CDP utilities for Grok image generation.
+ * Chrome CDP utilities for Grok image & video generation.
  * Based on patterns from baoyu-post-to-x/scripts/x-utils.ts
+ * Reuses x-browser-profile — grok.com "Sign in with X" shares cookies.
  */
 
 import { spawn } from 'node:child_process';

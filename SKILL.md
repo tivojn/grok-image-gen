@@ -1,13 +1,13 @@
 ---
 name: grok-image-gen
-description: Generate images using Grok AI on x.com via Chrome browser automation. Supports reference image uploads for style transfer, variations, and edits. Use when user says "generate image with Grok", "Grok image", "create image with Grok", or wants AI image generation through x.com's Grok.
+description: Generate images and videos using Grok AI via Chrome browser automation. Supports reference image uploads for style transfer, variations, and edits. Video generation uses grok.com/imagine. Use when user says "generate image with Grok", "Grok image", "Grok video", "create image/video with Grok", or wants AI image/video generation through Grok.
 ---
 
 Base directory for this skill: /Users/zanearcher/.claude/skills/grok-image-gen
 
-# Grok Image Generator
+# Grok Image & Video Generator
 
-Generate images using Grok AI on x.com via real Chrome browser automation (CDP).
+Generate images and videos using Grok AI via real Chrome browser automation (CDP). Images use x.com/i/grok, videos use grok.com/imagine.
 
 ## Script Directory
 
@@ -51,6 +51,15 @@ npx -y bun ${SKILL_DIR}/scripts/main.ts "Create a cartoon version of this" -r ph
 
 # Use custom Chrome profile
 npx -y bun ${SKILL_DIR}/scripts/main.ts "A dragon" --profile /path/to/profile
+
+# Generate a video (uses grok.com/imagine)
+npx -y bun ${SKILL_DIR}/scripts/main.ts --video "A cat playing piano" --output cat.mp4
+
+# Video with specific aspect ratio
+npx -y bun ${SKILL_DIR}/scripts/main.ts --video --aspect 16:9 "Ocean waves crashing" --output waves.mp4
+
+# Video with reference image
+npx -y bun ${SKILL_DIR}/scripts/main.ts --video -r photo.jpg "Animate this photo" --output animated.mp4
 ```
 
 ## Options
@@ -62,19 +71,33 @@ npx -y bun ${SKILL_DIR}/scripts/main.ts "A dragon" --profile /path/to/profile
 | `--reference`, `-r` | Reference image path for Grok to use as visual context (repeatable for multiple images) |
 | `--output`, `-o` | Output image path (default: grok-image.png) |
 | `--all` | Save all generated images (numbered: name-1.png, name-2.png, etc.) |
-| `--timeout` | Max wait time in seconds (default: 120) |
+| `--video` | Generate video instead of image (uses grok.com/imagine) |
+| `--aspect <ratio>` | Aspect ratio: 2:3, 3:2, 1:1, 9:16, 16:9 (for video/imagine mode) |
+| `--timeout` | Max wait time in seconds (default: 120 for images, 300 for video) |
 | `--profile <dir>` | Custom Chrome profile directory |
 | `--json` | Output JSON with image URLs and paths |
 
 ## How It Works
 
+### Image Mode (default)
 1. Launches real Chrome with CDP (reuses x.com login session)
 2. Navigates to `x.com/i/grok`
-3. If reference images provided (`-r`), uploads them via the attachment button (CDP file chooser interception)
+3. If reference images provided (`-r`), uploads them via the attachment button
 4. Types the prompt into Grok's chat input
 5. Waits for image generation to complete
 6. Extracts generated image URLs from the DOM
 7. Downloads and saves images locally
+
+### Video Mode (`--video`)
+1. Launches real Chrome with CDP (reuses x.com login session)
+2. Navigates to `grok.com/imagine`
+3. Clicks the settings dropdown and selects "Video" mode
+4. Sets aspect ratio if `--aspect` is specified
+5. If reference images provided (`-r`), uploads them
+6. Types the prompt and submits
+7. Waits for video generation (up to 300s default — videos take longer)
+8. Extracts video URL from DOM (video/source elements)
+9. Downloads and saves as .mp4
 
 ## Authentication
 
